@@ -55,6 +55,16 @@ async function shouldFetch(pi: ExtensionAPI, cwd: string): Promise<boolean> {
   }
 }
 
+async function hasUnmergedPaths(pi: ExtensionAPI, cwd: string): Promise<boolean> {
+  const result = await gitExec(pi, cwd, ["ls-files", "--unmerged"]);
+  return result.success && result.stdout.trim().length > 0;
+}
+
+async function isWorktreeDirty(pi: ExtensionAPI, cwd: string): Promise<boolean> {
+  const result = await gitExec(pi, cwd, ["status", "--porcelain"]);
+  return result.success && result.stdout.trim().length > 0;
+}
+
 export async function gitExec(
   pi: ExtensionAPI,
   cwd: string,
@@ -66,7 +76,13 @@ export async function gitExec(
 
   try {
     const result = await pi.exec("git", args, { cwd, signal: controller.signal });
-    return { stdout: result.stdout || "", success: true };
+    // pi.exec resolves for nonzero exit codes and only rejects on abort/throw,
+    // so the exit code is the only reliable success signal.
+    const code = result.code ?? 0;
+    if (result.killed && controller.signal.aborted) {
+      return { stdout: "", success: false, timeout: true };
+    }
+    return { stdout: result.stdout || result.stderr || "", success: code === 0 };
   } catch (error) {
     const err = error as { name?: string; code?: string; message?: string };
     const isTimeout = err?.name === "AbortError" || err?.code === "ABORT_ERR";
@@ -106,14 +122,68 @@ export async function syncRepository(pi: ExtensionAPI, settings: MemoryMdSetting
       if (!fetchResult.success) return { success: false, message: fetchResult.stdout || "Fetch failed" };
     }
 
+    if (await hasUnmergedPaths(pi, localPath)) {
+      return {
+        success: false,
+        level: "warning",
+        message: `[${repoName}] has unresolved merge conflicts — resolve them ('git status', 'git diff --diff-filter=U') before syncing`,
+      };
+    }
+
     const behindCount = await getBehindCount(pi, localPath);
     if (behindCount === 0) {
       return { success: true, message: `[${repoName}] is already latest`, updated: false };
     }
 
-    const updateResult = await gitExec(pi, localPath, ["rebase", "--autostash", "@{u}"]);
-    if (updateResult.timeout) return { success: false, message: TIMEOUT_MESSAGE };
-    if (!updateResult.success) return { success: false, message: updateResult.stdout || "Update failed" };
+    // Stash explicitly instead of `rebase --autostash`: when the autostash re-apply
+    // conflicts, git finishes the rebase, keeps the stash and leaves unmerged paths
+    // behind, so pull looks successful and every later pull stacks another autostash.
+    const stashResult = (await isWorktreeDirty(pi, localPath))
+      ? await gitExec(pi, localPath, ["stash", "push", "--include-untracked", "-m", "pi-memory-md pre-pull"])
+      : null;
+    if (stashResult && !stashResult.success) {
+      return { success: false, message: stashResult.stdout || "Stashing local memory changes failed" };
+    }
+
+    const updateResult = await gitExec(pi, localPath, ["rebase", "@{u}"]);
+    if (updateResult.timeout) {
+      await gitExec(pi, localPath, ["rebase", "--abort"]);
+      const restored = stashResult ? await gitExec(pi, localPath, ["stash", "pop"]) : null;
+      return {
+        success: false,
+        message:
+          stashResult && !(restored && restored.success)
+            ? `${TIMEOUT_MESSAGE} Local memory edits are kept in stash@{0}.`
+            : TIMEOUT_MESSAGE,
+      };
+    }
+    if (!updateResult.success) {
+      const abortResult = await gitExec(pi, localPath, ["rebase", "--abort"]);
+      // Pop regardless of the abort result: when the rebase never started, abort fails
+      // but the tree is clean, so the stash still has to come back.
+      const restored = stashResult ? await gitExec(pi, localPath, ["stash", "pop"]) : null;
+      const kept =
+        stashResult && !(restored && restored.success) ? " Local memory edits are kept in stash@{0}." : "";
+      const aborted = abortResult.success ? "" : " (could not abort the rebase, run 'git rebase --abort')";
+      return {
+        success: false,
+        message: `Rebase of [${repoName}] onto upstream failed: ${updateResult.stdout || "update failed"}.${kept}${aborted}`,
+      };
+    }
+
+    if (stashResult) {
+      const popResult = await gitExec(pi, localPath, ["stash", "pop"]);
+      if (!popResult.success) {
+        // Keep the stash (the only copy of the edits), but never leave conflict markers in the tree.
+        await gitExec(pi, localPath, ["reset", "--hard"]);
+        return {
+          success: false,
+          level: "warning",
+          message: `[${repoName}] pulled the latest commits, but local memory edits conflict with them. The edits are safe in stash@{0}: resolve with 'cd ${localPath} && git stash pop'`,
+        };
+      }
+    }
+
 
     if (behindCount !== null && behindCount > 0) {
       const remainingBehindCount = await getBehindCount(pi, localPath);

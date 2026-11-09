@@ -753,7 +753,7 @@ function registerMemoryCommands(pi: ExtensionAPI, settings: MemoryMdSettings, st
       const statusResult = settings.localPath
         ? await gitExec(pi, settings.localPath, ["status", "--porcelain"])
         : { stdout: "", success: false };
-      const isDirty = statusResult.stdout.trim().length > 0;
+      const isDirty = statusResult.success && statusResult.stdout.trim().length > 0;
       const repoStatus = settings.localPath ? (isDirty ? "Uncommitted changes" : "Clean") : "Not configured";
       ctx.ui.notify(
         `Memory: ${info.name} | Repo: ${repoStatus} | Files: ${info.project.fileCount ?? 0} | Path: ${info.memoryPath}`,
